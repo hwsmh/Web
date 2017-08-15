@@ -8,6 +8,8 @@
 #include <boost/algorithm/algorithm.hpp>
 #include <unordered_map>
 #include <boost/regex.hpp>
+#include <boost/algorithm/string/predicate.hpp>
+#include <thread>
 
 
 
@@ -20,6 +22,7 @@ protected:
 	//unsigned short port_;
 	long timeout_request_;
 	long timeout_content_;
+	std::vector<std::thread> threads_;
 public:
 	server_base(unsigned short port,size_t num_threads,long timeout_request,long timeout_send_or_receive)
 		:acceptor_(io_service_)
@@ -99,9 +102,26 @@ public:
 
 	  accept();
 
-	  io_service_.run();
-	}
 
+	  threads_.clear();
+	  for (size_t c = 1;c < config_.num_threads_;c++)
+	  {
+		  threads_.emplace_back(
+			  [this]()
+			  {
+				  io_service_.run();
+			  }
+		  );
+	  }
+
+	  io_service_.run();
+
+	  for (auto& t : threads_)
+	  {
+		  t.join();
+	  }
+	}
+	
 	void stop()
 	{
 		acceptor_.close();
@@ -145,17 +165,16 @@ public:
 		}
 	};
 
-	class Requset
+	class Request
 	{
 		friend class server_base<socket_type>;
 	private:
 		boost::asio::streambuf streambuf_;
-		Content content_;
-
+		
+	
 	public:
-		std::string remote_endpoint_address;
-		unsigned short remote_endpoint_port;
-		Requset()
+		Content content_;
+		Request()
 			:content_(streambuf_)
 		{}
 
@@ -167,7 +186,6 @@ public:
 				return boost::algorithm::iequals(key1, key2);
 			}
 		};
-
 
 		class ihash
 		{
@@ -182,7 +200,15 @@ public:
 				return hashvalue;
 			}
 		};
+	public:
+		boost::smatch path_match_;
+		std::string remote_endpoint_address;
+		unsigned short remote_endpoint_port;
+		std::string method_, path_, http_version_;
+		std::unordered_multimap<std::string, std::string, ihash, iequal_to> header_;
 	};
+
+	
 
 	class Config
 	{
@@ -205,17 +231,17 @@ public:
 
 	std::function<void(const std::exception&)> exception_handler;
 
-	std::unordered_map<std::string, std::unordered_map<std::string, std::function<void()> > > resource_;
+	std::unordered_map<std::string, std::unordered_map<std::string, std::function<void(std::shared_ptr< typename server_base<socket_type>::Response> response, std::shared_ptr< typename server_base<socket_type>::Request> request)> > > resource_;
 
-	std::unordered_map<std::string, std::function<void()> > default_resource_;
+	std::unordered_map<std::string, std::function<void(std::shared_ptr< typename server_base<socket_type>::Response> response, std::shared_ptr< typename server_base<socket_type>::Request> request)> > default_resource_;
 
 	private:
-		std::vector<std::pair<std::string,std::vector<std::pair<boost::regex,std::function<void()> > > > > opt_resource;
+		std::vector< std::pair < std::string, std::vector < std::pair < boost::regex,std::function<void(std::shared_ptr<typename server_base<socket_type>::Response>response, std::shared_ptr<typename server_base<socket_type>::Request> request) > > > > > opt_resource;
    public:
 	void read_request_and_contect(std::shared_ptr<socket_type> socket)
 	{
 
-		std::shared_ptr<Requset>request(new Requset);
+		std::shared_ptr<Request>request(new Request);
 		try
 		{
 
@@ -235,26 +261,228 @@ public:
 
 		if (timeout_request_ > 0)
 		{
-			std::cout << "定时器被安装\n";
+			/*std::cout << "定时器被安装\n";*/
 			timer = set_timeout_on_socket(socket, timeout_request_);
 		}
 		 
 		boost::asio::async_read_until(*socket, request->streambuf_, "\r\n\r\n",
 			[this,socket,request,timer](const boost::system::error_code& error,size_t bytes_transferred)
 			{
-			std::cout << request->content_.string();
+		
 					if (timeout_request_ > 0)
 					{
-						std::cout << "定时器被取消\n";
+						/*std::cout << "定时器被取消\n";*/
 						timer->cancel();
 					}
 					if (!error)
 					{
 						size_t num_additional_bytes = request->streambuf_.size() - bytes_transferred;
 						//std::cout << "附加数据大小为：" << num_additional_bytes << std::endl;
+
+						if (!parse_request(request, request->content_))
+							return;
+					       
+						auto it = request->header_.find("Content-Length");
+						if (it != request->header_.end())
+						{
+								std::shared_ptr<boost::asio::deadline_timer> timer;
+								if (timeout_content_ > 0)
+								{
+									timer = set_timeout_on_socket(socket, timeout_content_);
+								}
+								unsigned long long content_length;
+
+								try
+								{
+									content_length = stoull(it->second);
+								}
+								catch (const std::exception& e)
+								{
+									if (exception_handler)
+									{
+										exception_handler(e);
+									}
+
+									return;
+								}
+
+								if (content_length > num_additional_bytes)
+									{
+										boost::asio::async_read(*socket, request->streambuf_,
+											boost::asio::transfer_exactly(content_length - num_additional_bytes),
+											[this, socket, request, timer](const boost::system::error_code& error, size_t bytes_transferred)
+										{
+											if (timeout_content_ > 0)
+											{
+												timer->cancel();
+											}
+											if (!error)
+											{
+												find_resource(socket, request);
+											}
+										});
+									}
+								else
+									{
+										find_resource(socket, request);
+									}
+						}
+						else
+						{
+							find_resource(socket, request);
+						}
 					}
 			});
 	}
+
+	void find_resource(std::shared_ptr<socket_type> socket, std::shared_ptr<Request> request)
+	{
+		 for (auto& res : opt_resource)
+		 {
+			 if (request->method_ == res.first)
+			 {
+				 for (auto& res_path : res.second)
+				 {
+					 boost::smatch sm_res;
+					 if (boost::regex_match(request->path_,sm_res, res_path.first))
+					 {
+						 request->path_match_ = std::move(sm_res);
+						 write_response(socket,request,res_path.second);
+						 return;
+					 }
+				 }
+			 }
+		 }
+		 auto it_method = default_resource_.find(request->method_);
+		 if (it_method != default_resource_.end())
+		 {
+			 write_response(socket, request, it_method->second);
+		 }
+	}
+
+	void write_response(std::shared_ptr<socket_type> socket,
+		std::shared_ptr<Request> request,
+		std::function<void(std::shared_ptr< typename server_base<socket_type>::Response> response, std::shared_ptr< typename server_base<socket_type>::Request> request)>& resource_function)
+	{
+		
+		std::shared_ptr<boost::asio::deadline_timer> timer;
+		if (timeout_content_ > 0)
+			timer = set_timeout_on_socket(socket, timeout_content_);
+
+		auto response = std::shared_ptr<Response>(new Response(socket), [this, request, timer](Response* response_ptr)
+		{
+			auto response = std::shared_ptr<Response>(response_ptr);
+			send(response, [this, response, request, timer](const boost::system::error_code& ec)
+			{
+				if (!ec)
+				{
+					if (timeout_content_ > 0)
+						timer->cancel();
+					float http_version;
+					try
+					{
+						http_version = stof(request->http_version_);
+					}
+					catch (const std::exception& e)
+					{
+						if (exception_handler)
+							exception_handler(e);
+						return;
+
+					}
+
+					auto range = request->header_.equal_range("Connection");
+					for (auto it = range.first; it != range.second; it++)
+					{
+						if (boost::iequals(it->second, "close"))
+							return;
+					}
+					if (http_version > 1.05)
+						read_request_and_contect(response->socket_);
+				}
+			});
+		});
+		try
+		{
+			resource_function(response, request);
+		}
+		catch (const std::exception& e)
+		{
+			if (exception_handler)
+				exception_handler(e);
+			return;
+
+		}
+	}
+
+	bool parse_request(std::shared_ptr<Request> request, std::istream& stream)const
+	{
+		std::string line;
+		getline(stream,line);
+		size_t method_end;
+
+		
+		if ((method_end = line.find(' ')) != std::string::npos)
+		{
+	
+			size_t path_end;
+			if ((path_end = line.find(' ', method_end + 1)) != std::string::npos)
+			{
+				request->method_ = line.substr(0, method_end);
+				request->path_ = line.substr(method_end + 1, path_end - method_end - 1);
+
+				size_t protocol_end;
+				if ((protocol_end = line.find('/', path_end + 1)) != std::string::npos)
+				{
+					if (line.substr(path_end + 1, protocol_end - path_end - 1) != "HTTP")
+					{
+						return false;
+					}
+					request->http_version_ = line.substr(protocol_end + 1, line.size() - protocol_end - 2);
+				}
+
+				std::cout << "方法:" << request->method_
+					<< "\n路径:" << request->path_
+					<< "\n版本号:" << request->http_version_
+					<< std::endl;
+
+				getline(stream, line);
+				size_t parm_end;
+				while ((parm_end = line.find(':')) != std::string::npos)
+				{
+					size_t value_start = parm_end + 1;
+					if (value_start < line.size())
+					{
+						if (line[value_start] == ' ')
+						{
+							value_start++;
+						}
+						if (value_start < line.size())
+						{
+							std::cout << "--------------\n";
+							printf("%s\n", line.substr(0, parm_end).c_str());
+							printf("%s\n", line.substr(value_start, line.size() - value_start - 1).c_str());
+							request->header_.insert(
+								std::make_pair(line.substr(0, parm_end).c_str(), line.substr(value_start, line.size() - value_start - 1))
+							);
+						}
+
+						getline(stream, line);
+					}
+				}
+
+			}
+			else
+				return false;
+		}
+		else false;
+
+		return true;
+	}
+
+
+
+	
 
 	std::shared_ptr<boost::asio::deadline_timer> set_timeout_on_socket(std::shared_ptr<socket_type> socket, long seconds)
 	{
